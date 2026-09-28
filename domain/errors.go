@@ -1,9 +1,11 @@
 // Package domain 实现广告预算的预占（reserve）、核销（capture）、
-// 取消（cancel）与过期（expire）核心领域逻辑。
+// 取消（cancel）与过期（expire）核心领域逻辑，并支持按时段节奏控制
+// （pacing curve）与带配置版本的预算调整。
 //
 // 所有状态变更都以事件形式持久化，内存态由事件重放得到；
 // 服务内部用单一互斥锁把“校验—扣减—落事件”变成原子操作，
-// 保证并发争抢时总预算与日预算都不会被突破。
+// 保证并发争抢时总预算、日预算与当前时段节奏额度都不会被突破。
+// 凭证在创建时冻结日期/小时桶/配置版本，配置切换不重新归类历史费用。
 package domain
 
 import (
@@ -21,12 +23,14 @@ const (
 	CodeInvalidArgument ErrorCode = "invalid_argument"
 	// CodeNotFound 活动或凭证不存在（404）。
 	CodeNotFound ErrorCode = "not_found"
-	// CodeBudgetExceeded 总预算或日预算不足（422）。
+	// CodeBudgetExceeded 总预算、日预算或节奏额度不足（422）。
 	CodeBudgetExceeded ErrorCode = "budget_exceeded"
 	// CodeConflict 状态冲突：凭证已终态、迟到取消、失效凭证收到回执等（409）。
 	CodeConflict ErrorCode = "conflict"
-	// CodeIdempotencyConflict 幂等冲突：同一请求号/回执号但内容变化（409）。
+	// CodeIdempotencyConflict 幂等冲突：同一请求号/回执号/调整号但内容变化（409）。
 	CodeIdempotencyConflict ErrorCode = "idempotency_conflict"
+	// CodeVersionConflict 配置版本冲突：期望版本与当前版本不一致（409）。
+	CodeVersionConflict ErrorCode = "version_conflict"
 )
 
 // 各类别的哨兵错误，配合 errors.Is 使用。
@@ -36,6 +40,7 @@ var (
 	ErrBudgetExceeded      = &Error{Code: CodeBudgetExceeded}
 	ErrConflict            = &Error{Code: CodeConflict}
 	ErrIdempotencyConflict = &Error{Code: CodeIdempotencyConflict}
+	ErrVersionConflict     = &Error{Code: CodeVersionConflict}
 )
 
 // Error 是领域层统一错误类型，携带机器可读 Code 与人类可读信息。
@@ -43,12 +48,15 @@ type Error struct {
 	Code    ErrorCode
 	Op      string // 发生错误的操作，如 "Reserve"
 	Message string
-	// Level 仅预算不足时有意义："total" 或 "daily"。
+	// Level 仅预算不足时有意义："total" / "daily" / "pacing" / "total_floor" / "daily_floor"。
 	Level string
 	// Requested / Available 仅预算不足时填写。
 	Requested money.Money
 	Available money.Money
-	cause     error
+	// ExpectedVersion / ActualVersion 仅版本冲突时填写。
+	ExpectedVersion int64
+	ActualVersion   int64
+	cause           error
 }
 
 func (e *Error) Error() string {
@@ -96,6 +104,17 @@ func eBudget(op, level string, requested, available money.Money) error {
 		Available: available,
 		Message: fmt.Sprintf("%s budget insufficient: requested %s, available %s",
 			level, requested.String(), available.String()),
+	}
+}
+
+func eVersion(op string, expected, actual int64) error {
+	return &Error{
+		Code:            CodeVersionConflict,
+		Op:              op,
+		ExpectedVersion: expected,
+		ActualVersion:   actual,
+		Message: fmt.Sprintf("config version mismatch: expected %d, current is %d",
+			expected, actual),
 	}
 }
 
