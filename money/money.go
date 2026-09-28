@@ -51,6 +51,11 @@ func (m Money) MinorString() string {
 	return m.intVal().String()
 }
 
+// MinorBig 返回最小单位整数的拷贝，调用方可任意修改。
+func (m Money) MinorBig() *big.Int {
+	return new(big.Int).Set(m.intVal())
+}
+
 // Parse 解析十进制字符串，例如 "12.34"。超过 Scale 位小数会报错而不是静默截断。
 func Parse(s, currency string) (Money, error) {
 	s = strings.TrimSpace(s)

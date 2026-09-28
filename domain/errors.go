@@ -21,12 +21,14 @@ const (
 	CodeInvalidArgument ErrorCode = "invalid_argument"
 	// CodeNotFound 活动或凭证不存在（404）。
 	CodeNotFound ErrorCode = "not_found"
-	// CodeBudgetExceeded 总预算或日预算不足（422）。
+	// CodeBudgetExceeded 总预算、日预算或时段节奏额度不足（422）。
 	CodeBudgetExceeded ErrorCode = "budget_exceeded"
 	// CodeConflict 状态冲突：凭证已终态、迟到取消、失效凭证收到回执等（409）。
 	CodeConflict ErrorCode = "conflict"
-	// CodeIdempotencyConflict 幂等冲突：同一请求号/回执号但内容变化（409）。
+	// CodeIdempotencyConflict 幂等冲突：同一请求号/回执号/调整号但内容变化（409）。
 	CodeIdempotencyConflict ErrorCode = "idempotency_conflict"
+	// CodeVersionConflict 配置版本冲突：expected_version 与当前版本不一致（409）。
+	CodeVersionConflict ErrorCode = "version_conflict"
 )
 
 // 各类别的哨兵错误，配合 errors.Is 使用。
@@ -36,6 +38,7 @@ var (
 	ErrBudgetExceeded      = &Error{Code: CodeBudgetExceeded}
 	ErrConflict            = &Error{Code: CodeConflict}
 	ErrIdempotencyConflict = &Error{Code: CodeIdempotencyConflict}
+	ErrVersionConflict     = &Error{Code: CodeVersionConflict}
 )
 
 // Error 是领域层统一错误类型，携带机器可读 Code 与人类可读信息。
@@ -43,11 +46,20 @@ type Error struct {
 	Code    ErrorCode
 	Op      string // 发生错误的操作，如 "Reserve"
 	Message string
-	// Level 仅预算不足时有意义："total" 或 "daily"。
+	// Level 仅预算不足时有意义："total"、"daily" 或 "slot"。
 	Level string
+	// DayKey 在日/时段预算冲突时填写涉及的自然日。
+	DayKey string
 	// Requested / Available 仅预算不足时填写。
 	Requested money.Money
 	Available money.Money
+	// CurrentVersion 仅版本冲突时填写：活动当前配置版本。
+	CurrentVersion int64
+	// Limit / Committed 仅预算调整被整体拒绝时填写：
+	// Limit 是试图设置的新上限，Committed 是该上限不得低于的已占用金额
+	// （已核销额，或已核销额+有效预占）。
+	Limit     money.Money
+	Committed money.Money
 	cause     error
 }
 
@@ -96,6 +108,46 @@ func eBudget(op, level string, requested, available money.Money) error {
 		Available: available,
 		Message: fmt.Sprintf("%s budget insufficient: requested %s, available %s",
 			level, requested.String(), available.String()),
+	}
+}
+
+// eVersionConflict 构造版本冲突错误，带活动当前版本。
+func eVersionConflict(op string, expected, current int64) error {
+	return &Error{
+		Code:           CodeVersionConflict,
+		Op:             op,
+		CurrentVersion: current,
+		Message: fmt.Sprintf("config version conflict: expected %d, current is %d",
+			expected, current),
+	}
+}
+
+// eAdjustRejected 构造总预算调整被整体拒绝的错误。
+func eAdjustRejected(op string, limit, committed money.Money) error {
+	return &Error{
+		Code:      CodeBudgetExceeded,
+		Op:        op,
+		Level:     "total",
+		Limit:     limit,
+		Committed: committed,
+		Message: fmt.Sprintf("cannot lower total budget to %s: committed amount is %s "+
+			"(adjustment rejected as a whole, no reservation cancelled)",
+			limit.String(), committed.String()),
+	}
+}
+
+// eDailyAdjustRejected 构造日预算调整被整体拒绝的错误，带涉及的自然日。
+func eDailyAdjustRejected(op, dayKey string, limit, committed money.Money) error {
+	return &Error{
+		Code:      CodeBudgetExceeded,
+		Op:        op,
+		Level:     "daily",
+		DayKey:    dayKey,
+		Limit:     limit,
+		Committed: committed,
+		Message: fmt.Sprintf("cannot lower daily budget to %s: committed amount on %s is %s "+
+			"(adjustment rejected as a whole, no reservation cancelled)",
+			limit.String(), dayKey, committed.String()),
 	}
 }
 
