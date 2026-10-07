@@ -39,6 +39,8 @@ type adjustmentRecord struct {
 	CurveWeights []int64
 	HasCurve     bool
 	RemoveCurve  bool
+	// Reason 是本次调整的原因与依据（预算与配置调整均记录）。
+	Reason string
 }
 
 // Service 是预算领域服务。所有写操作在单互斥锁内完成
@@ -189,6 +191,7 @@ type AdjustBudgetParams struct {
 	ExpectedVersion int64       // 调用方看到的当前配置版本，乐观锁
 	TotalBudget     money.Money // 调整后的完整新总预算（必填，必须为正）
 	DailyCap        money.Money // 调整后的完整新日预算（必填，必须为正）
+	Reason          string      // 本次调整的原因与依据，随事件与版本流保存
 }
 
 // AdjustBudget 按配置版本调整总预算与日预算。
@@ -234,7 +237,8 @@ func (s *Service) AdjustBudget(ctx context.Context, p AdjustBudgetParams) (*Camp
 		if rec.CampaignID == p.CampaignID && rec.Kind == KindBudgetAdjust &&
 			rec.ExpectedVersion == p.ExpectedVersion &&
 			rec.TotalBudget.Cmp(p.TotalBudget) == 0 &&
-			rec.DailyCap.Cmp(p.DailyCap) == 0 {
+			rec.DailyCap.Cmp(p.DailyCap) == 0 &&
+			rec.Reason == p.Reason {
 			// 返回该调整落库时的版本快照，而不是当前版本（之后可能又有新调整）。
 			return s.campaignAtVersion(cs, rec.NewVersion)
 		}
@@ -270,6 +274,7 @@ func (s *Service) AdjustBudget(ctx context.Context, p AdjustBudgetParams) (*Camp
 		NewVersion:      newVersion,
 		TotalBudget:     toEvt(p.TotalBudget),
 		DailyCap:        toEvt(p.DailyCap),
+		Reason:          p.Reason,
 		At:              now,
 	})
 	if err != nil {
@@ -303,6 +308,7 @@ type AdjustConfigParams struct {
 	Timezone        *string
 	CurveWeights    []int64 // 非 nil：替换为 24 权重曲线
 	RemoveCurve     bool    // true：移除节奏曲线
+	Reason          string  // 本次调整的原因与依据，随事件与版本流保存
 }
 
 // AdjustConfig 切换时区/投放曲线并推进配置版本。
@@ -354,7 +360,8 @@ func (s *Service) AdjustConfig(ctx context.Context, p AdjustConfigParams) (*Camp
 			rec.ExpectedVersion == p.ExpectedVersion &&
 			rec.HasTimezone == hasTZ && rec.Timezone == tzName &&
 			rec.HasCurve == hasCurve && rec.RemoveCurve == p.RemoveCurve &&
-			equalInt64s(rec.CurveWeights, p.CurveWeights) {
+			equalInt64s(rec.CurveWeights, p.CurveWeights) &&
+			rec.Reason == p.Reason {
 			return s.campaignAtVersion(cs, rec.NewVersion)
 		}
 		return nil, eIdemConflict(op,
@@ -377,6 +384,7 @@ func (s *Service) AdjustConfig(ctx context.Context, p AdjustConfigParams) (*Camp
 		Curve:           p.CurveWeights,
 		HasCurve:        hasCurve,
 		RemoveCurve:     p.RemoveCurve,
+		Reason:          p.Reason,
 		At:              now,
 	})
 	if err != nil {
@@ -398,6 +406,80 @@ func equalInt64s(a, b []int64) bool {
 		}
 	}
 	return true
+}
+
+// ---------- 暂停 / 恢复 ----------
+
+// PauseCampaign 暂停活动投放：此后新的预占一律被拒绝（conflict），
+// 不产生任何消耗记录；已确认的回执核销仍正常入账。
+//
+// 暂停是幂等的状态操作：活动已处于暂停时直接返回当前状态，不重复落事件。
+// reason 记录本次暂停的原因与依据，随事件持久化。
+func (s *Service) PauseCampaign(ctx context.Context, campaignID, reason string) (*Campaign, error) {
+	const op = "PauseCampaign"
+	if campaignID == "" {
+		return nil, eInvalid(op, "campaign id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cs, ok := s.campaigns[campaignID]
+	if !ok {
+		return nil, eNotFound(op, "campaign %q not found", campaignID)
+	}
+	if cs.campaign.Status == CampaignPaused {
+		return cs.campaign, nil // 幂等：已暂停
+	}
+	now := s.clock.Now()
+	ev, err := marshalEvent(EvCampaignPaused, now, StatusChangedData{
+		CampaignID: campaignID,
+		Reason:     reason,
+		At:         now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.append(ctx, ev); err != nil {
+		return nil, err
+	}
+	return cs.campaign, nil
+}
+
+// ResumeCampaign 恢复活动投放：从当前已确认的消耗继续，按当前配置版本
+// 的预算与节奏目标放行新预占。暂停期间被拒绝的请求不会留下任何记录，
+// 恢复后不会把它们补记成有效曝光。
+//
+// 恢复是幂等的状态操作：活动已处于投放中时直接返回当前状态。
+func (s *Service) ResumeCampaign(ctx context.Context, campaignID, reason string) (*Campaign, error) {
+	const op = "ResumeCampaign"
+	if campaignID == "" {
+		return nil, eInvalid(op, "campaign id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cs, ok := s.campaigns[campaignID]
+	if !ok {
+		return nil, eNotFound(op, "campaign %q not found", campaignID)
+	}
+	if cs.campaign.Status == CampaignActive {
+		return cs.campaign, nil // 幂等：已在投放
+	}
+	now := s.clock.Now()
+	ev, err := marshalEvent(EvCampaignResumed, now, StatusChangedData{
+		CampaignID: campaignID,
+		Reason:     reason,
+		At:         now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.append(ctx, ev); err != nil {
+		return nil, err
+	}
+	return cs.campaign, nil
 }
 
 // campaignAtVersion 返回活动在指定配置版本时的配置快照（用于调整幂等重放，
@@ -426,6 +508,7 @@ func (s *Service) campaignAtVersion(cs *campaignState, version int64) (*Campaign
 	return &Campaign{
 		ID:          cs.campaign.ID,
 		Name:        cs.campaign.Name,
+		Status:      cs.campaign.Status,
 		TotalBudget: v.TotalBudget,
 		DailyCap:    v.DailyCap,
 		Location:    loc,
@@ -495,6 +578,12 @@ func (s *Service) Reserve(ctx context.Context, p ReserveParams) (*Reservation, e
 		return nil, eIdemConflict(op,
 			"request %q already reserved with amount %s, cannot reuse with %s",
 			p.RequestID, orig.Amount.String(), p.Amount.String())
+	}
+
+	// 活动暂停时拒绝一切新预占：不落事件、不留半条消耗记录。
+	// 暂停期间失败的请求在恢复后不会被补记。
+	if c.Status == CampaignPaused {
+		return nil, eConflict(op, "campaign %q is paused; new reservations are rejected", c.ID)
 	}
 
 	now := s.clock.Now()
@@ -817,6 +906,7 @@ type ConfigVersion struct {
 	DailyCap     money.Money
 	Timezone     string
 	CurveWeights []int64 // 该版本生效的曲线权重；无曲线为 nil
+	Reason       string  // 本次调整的原因与依据；create 时为空
 	At           time.Time
 }
 
@@ -987,6 +1077,7 @@ func (s *Service) apply(ev rawEvent) error {
 		c := &Campaign{
 			ID:          d.CampaignID,
 			Name:        d.Name,
+			Status:      CampaignActive,
 			TotalBudget: total,
 			DailyCap:    daily,
 			Location:    loc,
@@ -1036,6 +1127,7 @@ func (s *Service) apply(ev rawEvent) error {
 			NewVersion:      d.NewVersion,
 			TotalBudget:     total,
 			DailyCap:        daily,
+			Reason:          d.Reason,
 		}
 		s.history[d.CampaignID] = append(s.history[d.CampaignID], ConfigVersion{
 			Version:      d.NewVersion,
@@ -1045,6 +1137,7 @@ func (s *Service) apply(ev rawEvent) error {
 			DailyCap:     daily,
 			Timezone:     cs.campaign.Location.String(),
 			CurveWeights: curveWeights(cs.campaign.Curve),
+			Reason:       d.Reason,
 			At:           d.At,
 		})
 
@@ -1096,6 +1189,7 @@ func (s *Service) apply(ev rawEvent) error {
 			CurveWeights:    d.Curve,
 			HasCurve:        d.HasCurve,
 			RemoveCurve:     d.RemoveCurve,
+			Reason:          d.Reason,
 		}
 		s.history[d.CampaignID] = append(s.history[d.CampaignID], ConfigVersion{
 			Version:      d.NewVersion,
@@ -1105,8 +1199,24 @@ func (s *Service) apply(ev rawEvent) error {
 			DailyCap:     cs.campaign.DailyCap,
 			Timezone:     tzForRecord,
 			CurveWeights: weights,
+			Reason:       d.Reason,
 			At:           d.At,
 		})
+
+	case EvCampaignPaused, EvCampaignResumed:
+		var d StatusChangedData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return errBadEvent("%s: %v", ev.Type, err)
+		}
+		cs, ok := s.campaigns[d.CampaignID]
+		if !ok {
+			return errBadEvent("status change for unknown campaign %q", d.CampaignID)
+		}
+		if ev.Type == EvCampaignPaused {
+			cs.campaign.Status = CampaignPaused
+		} else {
+			cs.campaign.Status = CampaignActive
+		}
 
 	case EvReserved:
 		var d ReservedData

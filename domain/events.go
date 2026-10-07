@@ -10,6 +10,8 @@ const (
 	EvCampaignCreated = "campaign.created"
 	EvBudgetAdjusted  = "campaign.budget_adjusted"
 	EvConfigAdjusted  = "campaign.config_adjusted"
+	EvCampaignPaused  = "campaign.paused"
+	EvCampaignResumed = "campaign.resumed"
 	EvReserved        = "reservation.reserved"
 	EvCaptured        = "reservation.captured"
 	EvCancelled       = "reservation.cancelled"
@@ -44,6 +46,7 @@ type BudgetAdjustedData struct {
 	NewVersion      int64     `json:"new_version"`
 	TotalBudget     evtMoney  `json:"total_budget"`
 	DailyCap        evtMoney  `json:"daily_cap"`
+	Reason          string    `json:"reason,omitempty"`
 	At              time.Time `json:"at"`
 }
 
@@ -60,7 +63,16 @@ type ConfigAdjustedData struct {
 	Curve           []int64   `json:"curve,omitempty"`
 	HasCurve        bool      `json:"has_curve"`
 	RemoveCurve     bool      `json:"remove_curve,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
 	At              time.Time `json:"at"`
+}
+
+// StatusChangedData 是 EvCampaignPaused / EvCampaignResumed 的负载。
+// Reason 记录本次状态变化的原因与依据，随事件持久化，可在版本流中追溯。
+type StatusChangedData struct {
+	CampaignID string    `json:"campaign_id"`
+	Reason     string    `json:"reason,omitempty"`
+	At         time.Time `json:"at"`
 }
 
 // ReservedData 是 EvReserved 的负载。一次预占同时占用总预算、day_key 日预算

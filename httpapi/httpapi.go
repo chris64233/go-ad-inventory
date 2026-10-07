@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -42,6 +43,8 @@ func NewServer(svc *domain.Service) *Server {
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/reservations", s.reserve)
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/budget-adjustments", s.adjustBudget)
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/config-adjustments", s.adjustConfig)
+	s.mux.HandleFunc("POST /v1/campaigns/{id}/pause", s.pauseCampaign)
+	s.mux.HandleFunc("POST /v1/campaigns/{id}/resume", s.resumeCampaign)
 	s.mux.HandleFunc("GET /v1/campaigns/{id}/versions", s.getVersions)
 	s.mux.HandleFunc("GET /v1/campaigns/{id}/pacing", s.getPacing)
 	s.mux.HandleFunc("GET /v1/reservations/{id}", s.getReservation)
@@ -102,6 +105,7 @@ func (d duration) std() time.Duration { return time.Duration(d) }
 type campaignResp struct {
 	ID           string      `json:"id"`
 	Name         string      `json:"name"`
+	Status       string      `json:"status"`
 	TotalBudget  money.Money `json:"total_budget"`
 	DailyCap     money.Money `json:"daily_cap"`
 	Timezone     string      `json:"timezone"`
@@ -115,6 +119,7 @@ func toCampaignResp(c *domain.Campaign) campaignResp {
 	resp := campaignResp{
 		ID:          c.ID,
 		Name:        c.Name,
+		Status:      string(c.Status),
 		TotalBudget: c.TotalBudget,
 		DailyCap:    c.DailyCap,
 		Timezone:    c.Location.String(),
@@ -194,6 +199,7 @@ type adjustBudgetReq struct {
 	ExpectedVersion int64   `json:"expected_version"`
 	TotalBudget     moneyIn `json:"total_budget"`
 	DailyCap        moneyIn `json:"daily_cap"`
+	Reason          string  `json:"reason"`
 }
 
 type versionResp struct {
@@ -204,6 +210,7 @@ type versionResp struct {
 	DailyCap     money.Money `json:"daily_cap"`
 	Timezone     string      `json:"timezone"`
 	CurveWeights []int64     `json:"curve_weights,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
 	At           time.Time   `json:"at"`
 }
 
@@ -332,6 +339,7 @@ func (s *Server) adjustBudget(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: req.ExpectedVersion,
 		TotalBudget:     total,
 		DailyCap:        daily,
+		Reason:          req.Reason,
 	})
 	if err != nil {
 		writeDomainErr(w, err)
@@ -348,6 +356,7 @@ type adjustConfigRaw struct {
 	Timezone        *string         `json:"timezone"`
 	CurveWeights    json.RawMessage `json:"curve_weights"`
 	RemoveCurve     bool            `json:"remove_curve"`
+	Reason          string          `json:"reason"`
 }
 
 func (s *Server) adjustConfig(w http.ResponseWriter, r *http.Request) {
@@ -361,6 +370,7 @@ func (s *Server) adjustConfig(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: raw.ExpectedVersion,
 		Timezone:        raw.Timezone,
 		RemoveCurve:     raw.RemoveCurve,
+		Reason:          raw.Reason,
 	}
 	if raw.CurveWeights != nil {
 		// 字段存在：null 表示移除节奏限制。
@@ -399,6 +409,7 @@ func (s *Server) getVersions(w http.ResponseWriter, r *http.Request) {
 			TotalBudget:  v.TotalBudget,
 			DailyCap:     v.DailyCap,
 			Timezone:     v.Timezone,
+			Reason:       v.Reason,
 			At:           v.At,
 		}
 		if v.CurveWeights != nil {
@@ -407,6 +418,36 @@ func (s *Server) getVersions(w http.ResponseWriter, r *http.Request) {
 		out[i] = vr
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"versions": out})
+}
+
+type statusChangeReq struct {
+	Reason string `json:"reason"`
+}
+
+func (s *Server) pauseCampaign(w http.ResponseWriter, r *http.Request) {
+	var req statusChangeReq
+	if !decode(w, r, &req) {
+		return
+	}
+	c, err := s.svc.PauseCampaign(r.Context(), r.PathValue("id"), req.Reason)
+	if err != nil {
+		writeDomainErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toCampaignResp(c))
+}
+
+func (s *Server) resumeCampaign(w http.ResponseWriter, r *http.Request) {
+	var req statusChangeReq
+	if !decode(w, r, &req) {
+		return
+	}
+	c, err := s.svc.ResumeCampaign(r.Context(), r.PathValue("id"), req.Reason)
+	if err != nil {
+		writeDomainErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toCampaignResp(c))
 }
 
 func (s *Server) getPacing(w http.ResponseWriter, r *http.Request) {
@@ -518,6 +559,9 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true // 允许空 body（如暂停/恢复只带可选 reason）
+		}
 		writeDomainErr(w, invalid("invalid JSON body: %v", err))
 		return false
 	}
