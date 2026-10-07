@@ -32,10 +32,22 @@ func (s ReservationStatus) IsTerminal() bool {
 	return s == StatusCaptured || s == StatusCancelled || s == StatusExpired
 }
 
+// CampaignStatus 是活动的投放状态。
+type CampaignStatus string
+
+const (
+	// CampaignStatusActive 投放中：接受新的曝光预占。
+	CampaignStatusActive CampaignStatus = "active"
+	// CampaignStatusPaused 已暂停：拒绝新的曝光预占；
+	// 暂停前已确认的凭证仍可核销/取消/过期。
+	CampaignStatusPaused CampaignStatus = "paused"
+)
+
 // Campaign 是活动配置的投影。Version 从 1 起，每次预算调整加 1。
 type Campaign struct {
 	ID          string
 	Name        string
+	Status      CampaignStatus
 	TotalBudget money.Money
 	DailyCap    money.Money
 	Location    *time.Location

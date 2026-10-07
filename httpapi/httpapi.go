@@ -8,6 +8,8 @@
 //	POST /v1/campaigns/{id}/reservations        预占（幂等键 request_id）
 //	POST /v1/campaigns/{id}/budget-adjustments  带版本的预算调整（幂等键 adjustment_id）
 //	POST /v1/campaigns/{id}/config-adjustments  切换时区/投放曲线（带版本）
+//	POST /v1/campaigns/{id}/pause               暂停投放（拒绝新预占，可带 reason）
+//	POST /v1/campaigns/{id}/resume              恢复投放（从已确认消耗继续）
 //	GET  /v1/campaigns/{id}/versions            配置版本流
 //	GET  /v1/campaigns/{id}/pacing              逐时段目标/核销/预占/偏差
 //	GET  /v1/reservations/{id}                  查询凭证状态
@@ -42,6 +44,8 @@ func NewServer(svc *domain.Service) *Server {
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/reservations", s.reserve)
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/budget-adjustments", s.adjustBudget)
 	s.mux.HandleFunc("POST /v1/campaigns/{id}/config-adjustments", s.adjustConfig)
+	s.mux.HandleFunc("POST /v1/campaigns/{id}/pause", s.pauseCampaign)
+	s.mux.HandleFunc("POST /v1/campaigns/{id}/resume", s.resumeCampaign)
 	s.mux.HandleFunc("GET /v1/campaigns/{id}/versions", s.getVersions)
 	s.mux.HandleFunc("GET /v1/campaigns/{id}/pacing", s.getPacing)
 	s.mux.HandleFunc("GET /v1/reservations/{id}", s.getReservation)
@@ -102,6 +106,7 @@ func (d duration) std() time.Duration { return time.Duration(d) }
 type campaignResp struct {
 	ID           string      `json:"id"`
 	Name         string      `json:"name"`
+	Status       string      `json:"status"`
 	TotalBudget  money.Money `json:"total_budget"`
 	DailyCap     money.Money `json:"daily_cap"`
 	Timezone     string      `json:"timezone"`
@@ -115,6 +120,7 @@ func toCampaignResp(c *domain.Campaign) campaignResp {
 	resp := campaignResp{
 		ID:          c.ID,
 		Name:        c.Name,
+		Status:      string(c.Status),
 		TotalBudget: c.TotalBudget,
 		DailyCap:    c.DailyCap,
 		Timezone:    c.Location.String(),
@@ -173,6 +179,7 @@ type captureReq struct {
 
 type balanceResp struct {
 	CampaignID     string      `json:"campaign_id"`
+	Status         string      `json:"status"`
 	ConfigVersion  int64       `json:"config_version"`
 	TotalBudget    money.Money `json:"total_budget"`
 	TotalSpent     money.Money `json:"total_spent"`
@@ -194,12 +201,14 @@ type adjustBudgetReq struct {
 	ExpectedVersion int64   `json:"expected_version"`
 	TotalBudget     moneyIn `json:"total_budget"`
 	DailyCap        moneyIn `json:"daily_cap"`
+	Reason          string  `json:"reason"`
 }
 
 type versionResp struct {
 	Version      int64       `json:"version"`
 	Kind         string      `json:"kind"`
 	AdjustmentID string      `json:"adjustment_id,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
 	TotalBudget  money.Money `json:"total_budget"`
 	DailyCap     money.Money `json:"daily_cap"`
 	Timezone     string      `json:"timezone"`
@@ -294,6 +303,7 @@ func (s *Server) getBalance(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, balanceResp{
 		CampaignID:     b.CampaignID,
+		Status:         string(b.Status),
 		ConfigVersion:  b.Version,
 		TotalBudget:    b.TotalBudget,
 		TotalSpent:     b.TotalSpent,
@@ -332,6 +342,7 @@ func (s *Server) adjustBudget(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: req.ExpectedVersion,
 		TotalBudget:     total,
 		DailyCap:        daily,
+		Reason:          req.Reason,
 	})
 	if err != nil {
 		writeDomainErr(w, err)
@@ -348,6 +359,7 @@ type adjustConfigRaw struct {
 	Timezone        *string         `json:"timezone"`
 	CurveWeights    json.RawMessage `json:"curve_weights"`
 	RemoveCurve     bool            `json:"remove_curve"`
+	Reason          string          `json:"reason"`
 }
 
 func (s *Server) adjustConfig(w http.ResponseWriter, r *http.Request) {
@@ -361,6 +373,7 @@ func (s *Server) adjustConfig(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: raw.ExpectedVersion,
 		Timezone:        raw.Timezone,
 		RemoveCurve:     raw.RemoveCurve,
+		Reason:          raw.Reason,
 	}
 	if raw.CurveWeights != nil {
 		// 字段存在：null 表示移除节奏限制。
@@ -396,6 +409,7 @@ func (s *Server) getVersions(w http.ResponseWriter, r *http.Request) {
 			Version:      v.Version,
 			Kind:         v.Kind,
 			AdjustmentID: v.AdjustmentID,
+			Reason:       v.Reason,
 			TotalBudget:  v.TotalBudget,
 			DailyCap:     v.DailyCap,
 			Timezone:     v.Timezone,
@@ -407,6 +421,36 @@ func (s *Server) getVersions(w http.ResponseWriter, r *http.Request) {
 		out[i] = vr
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"versions": out})
+}
+
+type statusChangeReq struct {
+	Reason string `json:"reason"`
+}
+
+func (s *Server) pauseCampaign(w http.ResponseWriter, r *http.Request) {
+	var req statusChangeReq
+	if !decode(w, r, &req) {
+		return
+	}
+	c, err := s.svc.PauseCampaign(r.Context(), r.PathValue("id"), req.Reason)
+	if err != nil {
+		writeDomainErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toCampaignResp(c))
+}
+
+func (s *Server) resumeCampaign(w http.ResponseWriter, r *http.Request) {
+	var req statusChangeReq
+	if !decode(w, r, &req) {
+		return
+	}
+	c, err := s.svc.ResumeCampaign(r.Context(), r.PathValue("id"), req.Reason)
+	if err != nil {
+		writeDomainErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toCampaignResp(c))
 }
 
 func (s *Server) getPacing(w http.ResponseWriter, r *http.Request) {
@@ -552,7 +596,8 @@ func writeDomainErr(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case domain.CodeBudgetExceeded:
 		status = http.StatusUnprocessableEntity
-	case domain.CodeConflict, domain.CodeIdempotencyConflict, domain.CodeVersionConflict:
+	case domain.CodeConflict, domain.CodeIdempotencyConflict, domain.CodeVersionConflict,
+		domain.CodeCampaignPaused:
 		status = http.StatusConflict
 	}
 	body := errorBody{

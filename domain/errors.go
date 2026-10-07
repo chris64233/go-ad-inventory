@@ -29,6 +29,8 @@ const (
 	CodeIdempotencyConflict ErrorCode = "idempotency_conflict"
 	// CodeVersionConflict 配置版本冲突：expected_version 与当前版本不一致（409）。
 	CodeVersionConflict ErrorCode = "version_conflict"
+	// CodeCampaignPaused 活动已暂停：暂停期间拒绝新的曝光预占（409）。
+	CodeCampaignPaused ErrorCode = "campaign_paused"
 )
 
 // 各类别的哨兵错误，配合 errors.Is 使用。
@@ -39,6 +41,7 @@ var (
 	ErrConflict            = &Error{Code: CodeConflict}
 	ErrIdempotencyConflict = &Error{Code: CodeIdempotencyConflict}
 	ErrVersionConflict     = &Error{Code: CodeVersionConflict}
+	ErrCampaignPaused      = &Error{Code: CodeCampaignPaused}
 )
 
 // Error 是领域层统一错误类型，携带机器可读 Code 与人类可读信息。
@@ -97,6 +100,11 @@ func eConflict(op, format string, args ...any) error {
 
 func eIdemConflict(op, format string, args ...any) error {
 	return &Error{Code: CodeIdempotencyConflict, Op: op, Message: fmt.Sprintf(format, args...)}
+}
+
+func eCampaignPaused(op, campaignID string) error {
+	return &Error{Code: CodeCampaignPaused, Op: op,
+		Message: fmt.Sprintf("campaign %q is paused: new impressions are rejected until resumed", campaignID)}
 }
 
 func eBudget(op, level string, requested, available money.Money) error {
